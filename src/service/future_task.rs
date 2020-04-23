@@ -11,7 +11,6 @@ use std::{
         Arc,
     },
     task::{Context, Poll},
-    time::Duration,
 };
 
 use crate::service::SEND_SIZE;
@@ -26,7 +25,6 @@ pub(crate) struct FutureTaskManager {
     id_sender: mpsc::Sender<FutureTaskId>,
     id_receiver: mpsc::Receiver<FutureTaskId>,
     task_receiver: mpsc::Receiver<BoxedFutureTask>,
-    delay: Arc<AtomicBool>,
     shutdown: Arc<AtomicBool>,
 }
 
@@ -42,14 +40,20 @@ impl FutureTaskManager {
             id_sender,
             id_receiver,
             task_receiver,
-            delay: Arc::new(AtomicBool::new(false)),
             shutdown,
         }
     }
 
     fn add_task(&mut self, task: BoxedFutureTask) {
         let (sender, receiver) = oneshot::channel();
-        self.next_id += 1;
+
+        loop {
+            self.next_id = self.next_id.wrapping_add(1);
+            if !self.signals.contains_key(&self.next_id) {
+                break;
+            }
+        }
+
         self.signals.insert(self.next_id, sender);
 
         let task_id = self.next_id;
@@ -64,20 +68,6 @@ impl FutureTaskManager {
     // bounded future task has finished
     fn remove_task(&mut self, id: FutureTaskId) {
         self.signals.remove(&id);
-    }
-
-    fn set_delay(&mut self, cx: &mut Context) {
-        if !self.delay.load(Ordering::Acquire) {
-            self.delay.store(true, Ordering::Release);
-            let waker = cx.waker().clone();
-            let delay = self.delay.clone();
-            tokio::spawn(async move {
-                tokio::time::delay_until(tokio::time::Instant::now() + Duration::from_millis(100))
-                    .await;
-                waker.wake();
-                delay.store(false, Ordering::Release);
-            });
-        }
     }
 }
 
@@ -97,9 +87,7 @@ impl Stream for FutureTaskManager {
     type Item = ();
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
-        let mut task_finished = false;
-        let mut id_finished = false;
-        for _ in 0..128 {
+        loop {
             if self.shutdown.load(Ordering::SeqCst) {
                 debug!("future task finished because service shutdown");
                 return Poll::Ready(None);
@@ -112,18 +100,12 @@ impl Stream for FutureTaskManager {
                     return Poll::Ready(None);
                 }
                 Poll::Pending => {
-                    task_finished = true;
                     break;
                 }
             }
         }
 
-        for _ in 0..64 {
-            if self.shutdown.load(Ordering::SeqCst) {
-                debug!("future task finished because service shutdown");
-                return Poll::Ready(None);
-            }
-
+        loop {
             match Pin::new(&mut self.id_receiver).as_mut().poll_next(cx) {
                 Poll::Ready(Some(id)) => self.remove_task(id),
                 Poll::Ready(None) => {
@@ -131,14 +113,15 @@ impl Stream for FutureTaskManager {
                     return Poll::Ready(None);
                 }
                 Poll::Pending => {
-                    id_finished = true;
                     break;
                 }
             }
         }
 
-        if !task_finished || !id_finished {
-            self.set_delay(cx);
+        // double check here
+        if self.shutdown.load(Ordering::SeqCst) {
+            debug!("future task finished because service shutdown");
+            return Poll::Ready(None);
         }
 
         Poll::Pending
